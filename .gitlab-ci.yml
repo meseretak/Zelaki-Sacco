@@ -1,0 +1,166 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Zelaki Sacco — GitLab CI/CD Pipeline
+# Stages: lint → build → deploy
+#
+# REQUIRED GitLab CI/CD Variables (Settings → CI/CD → Variables):
+#   SSH_PRIVATE_KEY   — private key for SSH access to cPanel server  [Protected, Masked]
+#   CPANEL_HOST       — server hostname, e.g. server123.host.com     [Protected]
+#   CPANEL_USER       — cPanel SSH username                          [Protected]
+#   CPANEL_APP_DIR    — absolute app path, e.g. /home/user/zelaki-sacco
+#   DATABASE_URL      — file:/home/user/zelaki-sacco/db/custom.db    [Protected]
+#   NEXTAUTH_URL      — https://yourdomain.com                       [Protected]
+#   NEXTAUTH_SECRET   — 32-char random secret (openssl rand -base64 32) [Protected, Masked]
+# ═══════════════════════════════════════════════════════════════════════════════
+
+image: node:22-slim
+
+stages:
+  - lint
+  - build
+  - deploy
+
+variables:
+  NEXT_TELEMETRY_DISABLED: "1"
+  BUN_VERSION: "1.1.42"
+
+# ─── Shared: install Bun ──────────────────────────────────────────────────────
+.setup_bun:
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq curl unzip git
+    - curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}"
+    - export BUN_PATH="$HOME/.bun/bin"
+    - export PATH="$BUN_PATH:$PATH"
+    - bun --version
+
+# ─── Cache ───────────────────────────────────────────────────────────────────
+.node_cache:
+  cache:
+    key:
+      files:
+        - bun.lock
+    paths:
+      - node_modules/
+    policy: pull-push
+
+# ─── Lint ─────────────────────────────────────────────────────────────────────
+lint:
+  stage: lint
+  extends:
+    - .setup_bun
+    - .node_cache
+  script:
+    - export PATH="$HOME/.bun/bin:$PATH"
+    - bun install --frozen-lockfile
+    - bun run lint
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ─── Build ───────────────────────────────────────────────────────────────────
+build:
+  stage: build
+  extends:
+    - .setup_bun
+    - .node_cache
+  cache:
+    key:
+      files:
+        - bun.lock
+    paths:
+      - node_modules/
+    policy: pull
+  script:
+    - export PATH="$HOME/.bun/bin:$PATH"
+    - bun install --frozen-lockfile
+    - bun run build
+    # Verify standalone output was produced
+    - test -f .next/standalone/server.js || (echo "ERROR: standalone build missing server.js" && exit 1)
+    - echo "Build successful — standalone output verified"
+  artifacts:
+    name: "zelaki-sacco-build-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - .next/standalone/
+      - .next/static/
+      - public/
+      - prisma/
+      - package.json
+      - bun.lock
+    expire_in: 2 hours
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ─── Deploy ──────────────────────────────────────────────────────────────────
+deploy:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client rsync bash
+    # Configure SSH agent
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -H "$CPANEL_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - echo "==> Deploying to $CPANEL_HOST..."
+
+    # 1. Sync standalone build to server (preserving the db/ directory)
+    - >
+      rsync -az --delete
+      --exclude='db/'
+      .next/standalone/
+      "$CPANEL_USER@$CPANEL_HOST:$CPANEL_APP_DIR/.next/standalone/"
+
+    # 2. Sync static assets into standalone's .next/static
+    - >
+      rsync -az --delete
+      .next/static/
+      "$CPANEL_USER@$CPANEL_HOST:$CPANEL_APP_DIR/.next/standalone/.next/static/"
+
+    # 3. Sync public folder into standalone
+    - >
+      rsync -az --delete
+      --exclude='uploads/'
+      public/
+      "$CPANEL_USER@$CPANEL_HOST:$CPANEL_APP_DIR/.next/standalone/public/"
+
+    # 4. Sync prisma schema (for migrations)
+    - >
+      rsync -az
+      prisma/
+      "$CPANEL_USER@$CPANEL_HOST:$CPANEL_APP_DIR/prisma/"
+
+    # 5. Copy package.json (needed by npm on the server)
+    - scp package.json "$CPANEL_USER@$CPANEL_HOST:$CPANEL_APP_DIR/package.json"
+
+    # 6. On server: install prod deps, generate Prisma client, migrate, restart
+    - |
+      ssh "$CPANEL_USER@$CPANEL_HOST" "
+        set -e
+        cd \"$CPANEL_APP_DIR\"
+
+        echo '==> Installing production dependencies...'
+        npm install --omit=dev --legacy-peer-deps 2>&1 | tail -5
+
+        echo '==> Generating Prisma client for server OS...'
+        npx prisma generate
+
+        echo '==> Running database migrations...'
+        npx prisma migrate deploy
+
+        echo '==> Creating required directories...'
+        mkdir -p db tmp public/uploads/cvs
+
+        echo '==> Restarting app via Passenger...'
+        touch tmp/restart.txt
+
+        echo '==> Deploy complete!'
+      "
+
+  environment:
+    name: production
+    url: $NEXTAUTH_URL
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
