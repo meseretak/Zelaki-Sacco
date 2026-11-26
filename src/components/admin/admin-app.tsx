@@ -46,7 +46,7 @@ function useFetch<T>(url: string, deps: unknown[] = []) {
     try {
       const r = await fetch(url);
       const j = await r.json();
-      setData(j.items ?? j.testimonials ?? []);
+      setData(j.items ?? j.testimonials ?? j.jobs ?? j.navItems ?? j.pages ?? []);
     } catch {
       setData([]);
     } finally {

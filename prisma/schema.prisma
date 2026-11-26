@@ -277,7 +277,9 @@ model JobApplication {
   cvFileName  String?
   cvUrl       String?
   status      String   @default("new") // new | reviewed | interview | offered | rejected
+  notes       String?
   createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
   job         Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
 
   @@index([jobId])

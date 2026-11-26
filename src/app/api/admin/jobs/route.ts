@@ -6,7 +6,7 @@ import { verifyAdmin } from "@/lib/auth";
 export async function GET() {
   if (!(await verifyAdmin())) return NextResponse.json({ error: "Unauthorized", ok: false }, { status: 401 });
   const jobs = await db.job.findMany({ orderBy: { createdAt: "desc" }, include: { applications: { select: { id: true, status: true } } } });
-  return NextResponse.json({ ok: true, jobs: jobs.map((j) => ({ ...j, applicationCount: j.applications.length, applications: undefined })) });
+  return NextResponse.json({ ok: true, items: jobs.map((j) => ({ ...j, applicationCount: j.applications.length, applications: undefined })) });
 }
 
 // POST — create a job posting
